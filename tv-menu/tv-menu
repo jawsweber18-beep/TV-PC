@@ -1,0 +1,22 @@
+#!/bin/bash
+# Open the TV menu full-screen, starting its local server first if needed.
+dir="$HOME/.local/share/tv-menu"
+profile="$HOME/.var/app/org.mozilla.firefox/tvmenu-profile"
+url="http://127.0.0.1:8765/"
+
+if ! curl -fs -o /dev/null "$url"; then
+  nohup python3 "$dir/server.py" >/dev/null 2>&1 &
+  for _ in $(seq 40); do curl -fs -o /dev/null "$url" && break; sleep 0.25; done
+fi
+
+pkill -f tvmenu-profile
+mkdir -p "$profile"
+cat > "$profile/user.js" <<'PREFS'
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+user_pref("dom.gamepad.enabled", true);
+PREFS
+exec flatpak run org.mozilla.firefox --no-remote --profile "$profile" --kiosk "$url"

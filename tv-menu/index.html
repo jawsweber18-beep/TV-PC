@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TV Menu</title>
+<style>
+  :root { --bg: #0f1218; --tile: #1b2029; --tile-focus: #262d3a; --text: #eef1f6; --dim: #8b94a5; --accent: #4f9cf9; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: "Noto Sans", "Inter", system-ui, sans-serif; overflow: hidden; cursor: default; user-select: none; }
+  header { display: flex; justify-content: space-between; align-items: baseline; padding: 48px 80px 8px; }
+  h1 { font-size: 40px; font-weight: 600; margin: 0; }
+  #clock { font-size: 40px; font-variant-numeric: tabular-nums; color: var(--dim); }
+  main { height: calc(100% - 110px); overflow-y: auto; padding: 0 80px 80px; scroll-behavior: smooth; scrollbar-width: none; }
+  h2 { font-size: 26px; font-weight: 500; color: var(--dim); margin: 40px 0 20px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 28px; }
+  .tile { width: 240px; height: 270px; border-radius: 24px; background: var(--tile); display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; padding: 20px; border: 4px solid transparent;
+    transition: transform .12s, background .12s, border-color .12s; outline: none; }
+  .tile.focus { transform: scale(1.08); background: var(--tile-focus); border-color: var(--accent); }
+  .tile img, .glyph { width: 112px; height: 112px; object-fit: contain; }
+  .glyph { border-radius: 24px; display: flex; align-items: center; justify-content: center; font-size: 60px; font-weight: 700; color: #fff; }
+  .name { font-size: 22px; text-align: center; line-height: 1.2; max-width: 100%; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .sub { font-size: 16px; color: var(--dim); margin-top: -8px; }
+  #toast { position: fixed; bottom: 48px; left: 50%; transform: translateX(-50%); background: var(--tile-focus); padding: 18px 36px;
+    border-radius: 16px; font-size: 24px; opacity: 0; transition: opacity .2s; }
+  #toast.show { opacity: 1; }
+  .hint { position: fixed; bottom: 18px; right: 80px; color: var(--dim); font-size: 18px; }
+</style>
+</head>
+<body>
+<header><h1>Home</h1><div id="clock"></div></header>
+<main id="menu"></main>
+<div id="toast"></div>
+<div class="hint">D-pad / arrows to move · A / Enter to open</div>
+<script>
+const TOKEN = "__TOKEN__";
+const COLORS = ["#d93025", "#1e8e3e", "#4f9cf9", "#a142f4", "#e8710a", "#12b5cb", "#c5221f"];
+let tiles = [], focusIdx = 0, busy = false;
+
+function clock() {
+  document.getElementById("clock").textContent =
+    new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+async function load() {
+  const data = await (await fetch("/api/tiles")).json();
+  const keep = tiles[focusIdx] && tiles[focusIdx].dataset.id;
+  const menu = document.getElementById("menu");
+  menu.replaceChildren();
+  tiles = [];
+  for (const section of ["Apps", "Games", "Shortcuts"]) {
+    const items = data.filter(t => t.section === section);
+    if (!items.length) continue;
+    menu.append(el("h2", null, section));
+    const grid = el("div", "grid");
+    for (const t of items) {
+      const tile = el("div", "tile");
+      tile.dataset.id = t.id;
+      tile.dataset.name = t.name;
+      if (t.icon_url) {
+        const img = el("img");
+        img.src = t.icon_url;
+        tile.append(img);
+      } else {
+        const g = el("div", "glyph", t.glyph || t.name.charAt(0).toUpperCase());
+        g.style.background = t.color || COLORS[t.name.length % COLORS.length];
+        tile.append(g);
+      }
+      tile.append(el("div", "name", t.name));
+      if (t.sub) tile.append(el("div", "sub", t.sub));
+      tile.addEventListener("mouseenter", () => focus(tiles.indexOf(tile)));
+      tile.addEventListener("click", () => open(tile));
+      grid.append(tile);
+      tiles.push(tile);
+    }
+    menu.append(grid);
+  }
+  const again = tiles.findIndex(t => t.dataset.id === keep);
+  focus(again >= 0 ? again : 0);
+}
+
+function focus(i) {
+  if (!tiles.length) return;
+  tiles[focusIdx] && tiles[focusIdx].classList.remove("focus");
+  focusIdx = Math.max(0, Math.min(i, tiles.length - 1));
+  tiles[focusIdx].classList.add("focus");
+  tiles[focusIdx].scrollIntoView({ block: "nearest" });
+}
+
+// Pick the closest tile in the pressed direction
+function move(dx, dy) {
+  const a = tiles[focusIdx].getBoundingClientRect();
+  const ax = a.left + a.width / 2, ay = a.top + a.height / 2;
+  let best = -1, bestScore = Infinity;
+  tiles.forEach((t, i) => {
+    if (i === focusIdx) return;
+    const b = t.getBoundingClientRect();
+    const x = b.left + b.width / 2 - ax, y = b.top + b.height / 2 - ay;
+    const along = x * dx + y * dy, across = Math.abs(x * dy) + Math.abs(y * dx);
+    if (along <= 0) return;
+    const score = along + across * 3;
+    if (score < bestScore) { bestScore = score; best = i; }
+  });
+  if (best >= 0) focus(best);
+}
+
+function toast(text) {
+  const t = document.getElementById("toast");
+  t.textContent = text;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2500);
+}
+
+async function open(tile) {
+  if (busy) return;
+  busy = true;
+  setTimeout(() => busy = false, 2000);
+  toast("Opening " + tile.dataset.name + "…");
+  const r = await fetch(`/api/launch?id=${tile.dataset.id}&token=${TOKEN}`, { method: "POST" });
+  if (!r.ok) toast("Couldn't open " + tile.dataset.name);
+}
+
+document.addEventListener("keydown", e => {
+  const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  if (dirs[e.key]) { move(...dirs[e.key]); e.preventDefault(); }
+  else if (e.key === "Enter" || e.key === " ") { open(tiles[focusIdx]); e.preventDefault(); }
+});
+
+// Game controller: d-pad or left stick to move, A to open
+let lastMove = 0, aWasDown = true;
+function poll(now) {
+  for (const pad of navigator.getGamepads ? navigator.getGamepads() : []) {
+    if (!pad) continue;
+    const b = i => pad.buttons[i] && pad.buttons[i].pressed;
+    const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+    let dx = b(14) || ax < -0.6 ? -1 : b(15) || ax > 0.6 ? 1 : 0;
+    let dy = b(12) || ay < -0.6 ? -1 : b(13) || ay > 0.6 ? 1 : 0;
+    if (dx && dy) Math.abs(ax) > Math.abs(ay) ? dy = 0 : dx = 0;
+    if ((dx || dy) && now - lastMove > 220) { move(dx, dy); lastMove = now; }
+    if (b(0) && !aWasDown) open(tiles[focusIdx]);
+    aWasDown = b(0);
+    break;
+  }
+  requestAnimationFrame(poll);
+}
+
+clock();
+setInterval(clock, 10000);
+load();
+setInterval(() => { if (document.visibilityState === "visible") load(); }, 30000);
+requestAnimationFrame(poll);
+</script>
+</body>
+</html>
