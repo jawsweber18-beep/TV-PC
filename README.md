@@ -5,7 +5,7 @@ A big-icon TV menu for a Bazzite (KDE) living-room PC, controllable with a game 
 It shows three rows of tiles:
 
 - **Apps**: YouTube, Steam (Big Picture), Brave and a Desktop tile that closes the menu
-- **Games**: every game launcher on the desktop (from `rom-desktop`), labeled with its system
+- **Games**: every game in `~/Games/roms/<system>/` (nes, snes, genesis, n64, gb, gbc, gba, psx, ps2, psp, nds, gc, wii, dreamcast), labeled with its system
 - **Shortcuts**: any other launchers on the desktop
 
 The menu opens full-screen when you log in. Move with the d-pad, left stick or arrow keys; open with A, Enter or a click.
@@ -28,6 +28,10 @@ The Apps row comes from `~/.config/tv-menu/apps.json` (created on first run). Ea
 ```
 
 The menu reloads its tiles every 30 seconds.
+
+## Troubleshooting
+
+Each app the menu starts is logged, with its error output, to `~/.cache/tv-menu/launch.log`.
 
 ## Files
 

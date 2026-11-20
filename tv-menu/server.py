@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """TV menu: serves the big-icon launcher page and starts apps when a tile is picked."""
-import hashlib, json, mimetypes, os, re, secrets, subprocess
+import glob, hashlib, json, mimetypes, os, re, secrets, subprocess, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -9,15 +9,38 @@ HOME = Path.home()
 HERE = Path(__file__).resolve().parent
 CONFIG = HOME / ".config/tv-menu/apps.json"
 DESKTOP = HOME / "Desktop"
+ROMS = HOME / "Games/roms"
+CORES = HOME / ".var/app/org.libretro.RetroArch/config/retroarch/cores"
+LOG = HOME / ".cache/tv-menu/launch.log"
 PORT = int(os.environ.get("TV_MENU_PORT", "8765"))
 TOKEN = secrets.token_hex(16)
 
-# Fill in the display settings if the server was started from SSH
+# Fill in the session basics if the server was started from SSH
 uid = os.getuid()
 os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
-os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
-os.environ.setdefault("DISPLAY", ":0")
 os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP")
+
+def ra(core):
+    return ["org.libretro.RetroArch", "-f", "-L", str(CORES / f"{core}_libretro.so")]
+
+# folder: (label, file extensions, flatpak command that goes before the ROM path)
+SYSTEMS = {
+    "nes":       ("NES",            {".nes", ".zip"},                         ra("fceumm")),
+    "snes":      ("SNES",           {".sfc", ".smc", ".zip"},                 ra("snes9x")),
+    "genesis":   ("Genesis",        {".md", ".gen", ".smd", ".bin", ".zip"},  ra("genesis_plus_gx")),
+    "n64":       ("N64",            {".z64", ".n64", ".v64", ".zip"},         ra("mupen64plus_next")),
+    "gb":        ("Game Boy",       {".gb", ".zip"},                          ra("gambatte")),
+    "gbc":       ("Game Boy Color", {".gbc", ".zip"},                         ra("gambatte")),
+    "gba":       ("GBA",            {".gba", ".zip"},                         ra("mgba")),
+    "psx":       ("PS1",            {".cue", ".chd", ".pbp", ".m3u"},         ra("swanstation")),
+    "ps2":       ("PS2",            {".iso", ".chd", ".cso"},                 ["net.pcsx2.PCSX2", "-batch", "-fullscreen", "--"]),
+    "psp":       ("PSP",            {".iso", ".cso", ".chd"},                 ["org.ppsspp.PPSSPP", "--fullscreen"]),
+    "nds":       ("DS",             {".nds"},                                 ["net.kuribo64.melonDS", "-f"]),
+    "gc":        ("GameCube",       {".iso", ".gcm", ".rvz", ".ciso"},        ["org.DolphinEmu.dolphin-emu", "-b", "-e"]),
+    "wii":       ("Wii",            {".iso", ".wbfs", ".rvz"},                ["org.DolphinEmu.dolphin-emu", "-b", "-e"]),
+    "dreamcast": ("Dreamcast",      {".gdi", ".chd", ".cdi"},                 ["org.flycast.Flycast"]),
+}
 
 DEFAULT_APPS = [
     {"name": "YouTube", "glyph": "▶", "color": "#d93025",
@@ -103,25 +126,60 @@ def tiles():
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CONFIG.write_text(json.dumps(DEFAULT_APPS, indent=2, ensure_ascii=False))
     items = [dict(app, section="Apps") for app in json.loads(CONFIG.read_text())]
+    for folder, (label, exts, cmd) in SYSTEMS.items():
+        for rom in sorted((ROMS / folder).rglob("*"), key=lambda p: p.name.lower()):
+            if rom.is_file() and rom.suffix.lower() in exts:
+                items.append({"name": rom.stem, "sub": label, "icon": cmd[0], "section": "Games",
+                              "exec": ["flatpak", "run", *cmd, str(rom)]})
     for f in sorted(DESKTOP.glob("*.desktop"), key=lambda p: p.name.lower()):
         e = read_desktop(f)
-        if e.get("Type", "Application") != "Application" or "Exec" not in e or e.get("Hidden") == "true":
+        if (e.get("Type", "Application") != "Application" or "Exec" not in e or e.get("Hidden") == "true"
+                or e.get("X-Rom-Desktop") == "true"):  # games already come from the ROM folders
             continue
         items.append({"name": e.get("Name", f.stem), "sub": e.get("Comment", ""), "icon": e.get("Icon"),
-                      "exec": split_exec(e["Exec"]),
-                      "section": "Games" if e.get("X-Rom-Desktop") == "true" else "Shortcuts"})
+                      "exec": split_exec(e["Exec"]), "section": "Shortcuts"})
     for t in items:
         t["id"] = hashlib.sha1(json.dumps([t["name"], t.get("exec"), t.get("action")]).encode()).hexdigest()[:12]
         path = find_icon(t.get("icon"))
         t["icon_url"] = "/icon?name=" + t["icon"] if path else None
     return items
 
+def session_env():
+    """The desktop session's display settings, so apps open on the TV even if this server started from SSH."""
+    env = dict(os.environ)
+    try:
+        out = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        if key in SESSION_KEYS and value:
+            env[key] = value
+    if "XAUTHORITY" not in env:
+        xauth = sorted(glob.glob(f"/run/user/{uid}/xauth_*"))
+        if xauth:
+            env["XAUTHORITY"] = xauth[-1]
+    return env
+
 def launch(tile):
+    """Start a tile's app. Returns False if it could not be started."""
     if tile.get("action") == "close":
         subprocess.run(["pkill", "-f", "tvmenu" + "-profile"])
-    elif tile.get("exec"):
-        subprocess.Popen(tile["exec"], cwd=HOME, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    if not tile.get("exec"):
+        return False
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a") as log:
+        log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {' '.join(tile['exec'])}\n")
+        log.flush()
+        try:
+            subprocess.Popen(tile["exec"], cwd=HOME, env=session_env(), stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=log, start_new_session=True)
+        except OSError as e:
+            log.write(f"failed to start: {e}\n")
+            return False
+    return True
 
 class Handler(BaseHTTPRequestHandler):
     def send(self, code, body, ctype):
@@ -155,8 +213,10 @@ class Handler(BaseHTTPRequestHandler):
         tile = next((t for t in tiles() if t["id"] == query.get("id", [""])[0]), None)
         if not tile:
             return self.send(404, b"", "text/plain")
-        launch(tile)
-        self.send(200, b"{}", "application/json")
+        if launch(tile):
+            self.send(200, b"{}", "application/json")
+        else:
+            self.send(500, b"", "text/plain")
 
     def log_message(self, *args):
         pass
