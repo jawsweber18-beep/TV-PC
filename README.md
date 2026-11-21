@@ -2,7 +2,9 @@
 
 A big-icon TV menu for a Bazzite (KDE) living-room PC, controllable with a game controller, an air mouse or a keyboard.
 
-It shows three rows of tiles:
+It shows rows of tiles:
+
+- **Running**: a Close tile for each app or game the menu opened that is still open
 
 - **Apps**: YouTube, Steam (Big Picture), Brave and a Desktop tile that closes the menu
 - **Games**: every game in `~/Games/roms/<system>/` (nes, snes, genesis, n64, gb, gbc, gba, psx, ps2, psp, nds, gc, wii, dreamcast), labeled with its system
@@ -13,11 +15,11 @@ The menu opens full-screen when you log in. Move with the d-pad, left stick or a
 ## Install
 
 ```bash
-sudo flatpak install -y flathub com.brave.Browser org.mozilla.firefox
+sudo flatpak install -y flathub com.brave.Browser
 curl -fsSL https://raw.githubusercontent.com/jawsweber18-beep/TV-PC/main/install-tv-menu.sh | bash
 ```
 
-Firefox runs the menu itself; Brave is used for the Browser and YouTube tiles.
+The menu opens in Brave (Firefox is used instead if Brave isn't installed). Its server runs in the background as the `tv-menu` user service, so the menu opens quickly.
 
 ## Customize
 

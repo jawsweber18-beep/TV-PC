@@ -1,15 +1,26 @@
 #!/bin/bash
 # Open the TV menu full-screen, starting its local server first if needed.
 dir="$HOME/.local/share/tv-menu"
-profile="$HOME/.var/app/org.mozilla.firefox/tvmenu-profile"
 url="http://127.0.0.1:8765/"
 
 if ! curl -fs -o /dev/null "$url"; then
-  nohup python3 "$dir/server.py" >/dev/null 2>&1 &
+  systemctl --user start tv-menu.service 2>/dev/null || nohup python3 "$dir/server.py" >/dev/null 2>&1 &
   for _ in $(seq 40); do curl -fs -o /dev/null "$url" && break; sleep 0.25; done
 fi
 
 pkill -f tvmenu-profile
+
+# Brave starts faster than Firefox here and is already in use for the other tiles
+if flatpak info com.brave.Browser >/dev/null 2>&1; then
+  profile="$HOME/.var/app/com.brave.Browser/tvmenu-profile"
+  # The menu is closed by killing it, so stop Brave offering to restore pages
+  sed -i 's/"exit_type":"Crashed"/"exit_type":"Normal"/' "$profile/Default/Preferences" 2>/dev/null
+  exec flatpak run com.brave.Browser --user-data-dir="$profile" --kiosk --no-first-run \
+    --no-default-browser-check --password-store=basic --noerrdialogs \
+    --disable-session-crashed-bubble --hide-crash-restore-bubble "$url"
+fi
+
+profile="$HOME/.var/app/org.mozilla.firefox/tvmenu-profile"
 mkdir -p "$profile"
 cat > "$profile/user.js" <<'PREFS'
 user_pref("browser.aboutwelcome.enabled", false);

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """TV menu: serves the big-icon launcher page and starts apps when a tile is picked."""
-import glob, hashlib, json, mimetypes, os, re, secrets, subprocess, time
+import glob, hashlib, json, mimetypes, os, re, secrets, signal, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -12,6 +12,7 @@ DESKTOP = HOME / "Desktop"
 ROMS = HOME / "Games/roms"
 CORES = HOME / ".var/app/org.libretro.RetroArch/config/retroarch/cores"
 LOG = HOME / ".cache/tv-menu/launch.log"
+ICON_CACHE = HOME / ".cache/tv-menu/icons.json"
 PORT = int(os.environ.get("TV_MENU_PORT", "8765"))
 TOKEN = secrets.token_hex(16)
 
@@ -56,22 +57,36 @@ ICON_DIRS = [HOME / ".local/share/icons", HOME / ".local/share/flatpak/exports/s
              Path("/var/lib/flatpak/exports/share/icons"), Path("/usr/share/icons/hicolor"),
              Path("/usr/share/icons/breeze"), Path("/usr/share/pixmaps")]
 _icons = None
+_lock = threading.Lock()
+
+def scan_icons():
+    """Map icon names to the best file (SVG first, then the largest PNG) and save the map for next time."""
+    global _icons
+    icons, scores = {}, {}
+    for base in ICON_DIRS:
+        for root, _, files in os.walk(base):
+            size = max([int(n) for n in re.findall(r"(\d+)x\d+", root)] or [48])
+            for f in files:
+                stem, ext = os.path.splitext(f)
+                if ext not in (".svg", ".png") or stem.endswith("-symbolic"):
+                    continue
+                score = 10000 if ext == ".svg" else size
+                if score > scores.get(stem, -1):
+                    scores[stem], icons[stem] = score, os.path.join(root, f)
+    _icons = icons
+    ICON_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    ICON_CACHE.write_text(json.dumps(icons))
+    return icons
 
 def icon_index():
-    """Map icon names to the best file: SVG first, then the largest PNG."""
+    """Use the saved icon map right away and refresh it in the background; scanning the disk is slow."""
     global _icons
     if _icons is None:
-        _icons, scores = {}, {}
-        for base in ICON_DIRS:
-            for root, _, files in os.walk(base):
-                size = max([int(n) for n in re.findall(r"(\d+)x\d+", root)] or [48])
-                for f in files:
-                    stem, ext = os.path.splitext(f)
-                    if ext not in (".svg", ".png") or stem.endswith("-symbolic"):
-                        continue
-                    score = 10000 if ext == ".svg" else size
-                    if score > scores.get(stem, -1):
-                        scores[stem], _icons[stem] = score, os.path.join(root, f)
+        try:
+            _icons = json.loads(ICON_CACHE.read_text())
+        except (OSError, ValueError):
+            return scan_icons()
+        threading.Thread(target=scan_icons, daemon=True).start()
     return _icons
 
 def find_icon(name):
@@ -121,7 +136,7 @@ def split_exec(value):
         args.append(cur)
     return [a.replace("%%", "%") for a in args if not re.fullmatch(r"%[fFuUdDnNickvm]", a)]
 
-def tiles():
+def build_tiles():
     if not CONFIG.exists():
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CONFIG.write_text(json.dumps(DEFAULT_APPS, indent=2, ensure_ascii=False))
@@ -144,6 +159,16 @@ def tiles():
         t["icon_url"] = "/icon?name=" + t["icon"] if path else None
     return items
 
+_tiles, _tiles_at = [], float("-inf")
+
+def tiles(max_age=10):
+    """The tile list, rebuilt at most every max_age seconds so clicks don't rescan the game folders."""
+    global _tiles, _tiles_at
+    with _lock:
+        if time.monotonic() - _tiles_at > max_age:
+            _tiles, _tiles_at = build_tiles(), time.monotonic()
+        return _tiles
+
 def session_env():
     """The desktop session's display settings, so apps open on the TV even if this server started from SSH."""
     env = dict(os.environ)
@@ -162,6 +187,63 @@ def session_env():
             env["XAUTHORITY"] = xauth[-1]
     return env
 
+RUNNING = {}  # tile id -> {"tile": tile, "proc": Popen}
+
+def running():
+    """Apps started from the menu that are still open."""
+    with _lock:
+        for tid in [tid for tid, r in RUNNING.items() if r["proc"].poll() is not None]:
+            del RUNNING[tid]
+        return list(RUNNING.values())
+
+def flatpak_id(cmd):
+    """The app id in a "flatpak run [options] APP ..." command, else None."""
+    if cmd[:2] != ["flatpak", "run"]:
+        return None
+    return next((a for a in cmd[2:] if not a.startswith("-")), None)
+
+def sandbox_instances(app, pid):
+    """Flatpak instances of app that were started by the process group pid leads."""
+    try:
+        out = subprocess.run(["flatpak", "ps", "--columns=instance,pid,application"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or parts[2] != app:
+            continue
+        try:
+            stat = Path(f"/proc/{parts[1]}/stat").read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if pid in (int(parts[1]), int(stat[1]), int(stat[2])):  # itself, its parent or its process group
+            found.append(parts[0])
+    return found
+
+def close(entry):
+    """Ask an app to quit, then force it after a few seconds."""
+    proc, cmd = entry["proc"], entry["tile"]["exec"]
+    app = flatpak_id(cmd)
+    instances = sandbox_instances(app, proc.pid) if app else []
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    def force():
+        try:
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for instance in instances:
+            subprocess.run(["flatpak", "kill", instance], capture_output=True)
+    threading.Thread(target=force, daemon=True).start()
+
 def launch(tile):
     """Start a tile's app. Returns False if it could not be started."""
     if tile.get("action") == "close":
@@ -174,18 +256,20 @@ def launch(tile):
         log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {' '.join(tile['exec'])}\n")
         log.flush()
         try:
-            subprocess.Popen(tile["exec"], cwd=HOME, env=session_env(), stdin=subprocess.DEVNULL,
-                             stdout=log, stderr=log, start_new_session=True)
+            proc = subprocess.Popen(tile["exec"], cwd=HOME, env=session_env(), stdin=subprocess.DEVNULL,
+                                    stdout=log, stderr=log, start_new_session=True)
         except OSError as e:
             log.write(f"failed to start: {e}\n")
             return False
+    with _lock:
+        RUNNING[tile["id"]] = {"tile": tile, "proc": proc}
     return True
 
 class Handler(BaseHTTPRequestHandler):
-    def send(self, code, body, ctype):
+    def send(self, code, body, ctype, cache="no-store"):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(body)
 
@@ -196,10 +280,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, html.encode(), "text/html; charset=utf-8")
         elif url.path == "/api/tiles":
             self.send(200, json.dumps(tiles()).encode(), "application/json")
+        elif url.path == "/api/running":
+            body = [{"id": r["tile"]["id"], "name": r["tile"]["name"]} for r in running()]
+            self.send(200, json.dumps(body).encode(), "application/json")
         elif url.path == "/icon":
             path = find_icon(parse_qs(url.query).get("name", [""])[0])
             if path:
-                self.send(200, Path(path).read_bytes(), mimetypes.guess_type(path)[0] or "image/png")
+                self.send(200, Path(path).read_bytes(), mimetypes.guess_type(path)[0] or "image/png",
+                          "max-age=86400")
             else:
                 self.send(404, b"", "text/plain")
         else:
@@ -208,9 +296,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         query = parse_qs(url.query)
-        if url.path != "/api/launch" or query.get("token", [""])[0] != TOKEN:
+        tid = query.get("id", [""])[0]
+        if url.path not in ("/api/launch", "/api/close") or query.get("token", [""])[0] != TOKEN:
             return self.send(403, b"", "text/plain")
-        tile = next((t for t in tiles() if t["id"] == query.get("id", [""])[0]), None)
+        if url.path == "/api/close":
+            entry = next((r for r in running() if r["tile"]["id"] == tid), None)
+            if not entry:
+                return self.send(404, b"", "text/plain")
+            close(entry)
+            return self.send(200, b"{}", "application/json")
+        tile = next((t for t in tiles(max_age=float("inf")) if t["id"] == tid), None) \
+            or next((t for t in tiles(max_age=0) if t["id"] == tid), None)
         if not tile:
             return self.send(404, b"", "text/plain")
         if launch(tile):
@@ -222,4 +318,6 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    threading.Thread(target=tiles, daemon=True).start()  # have the first page load ready
+    server.serve_forever()
