@@ -8,7 +8,10 @@ if ! curl -fs -o /dev/null "$url"; then
   for _ in $(seq 40); do curl -fs -o /dev/null "$url" && break; sleep 0.25; done
 fi
 
-pkill -f tvmenu-profile
+if pkill -f tvmenu-profile; then
+  sleep 2
+  pkill -9 -f tvmenu-profile
+fi
 
 # Brave starts faster than Firefox here and is already in use for the other tiles
 if flatpak info com.brave.Browser >/dev/null 2>&1; then

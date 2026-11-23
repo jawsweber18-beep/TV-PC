@@ -244,10 +244,20 @@ def close(entry):
             subprocess.run(["flatpak", "kill", instance], capture_output=True)
     threading.Thread(target=force, daemon=True).start()
 
+def close_menu():
+    """Close the menu's browser, forcing it if it hasn't quit within two seconds."""
+    tag = "tvmenu" + "-profile"  # split so this server's own command line never matches
+    subprocess.run(["pkill", "-f", tag])
+
+    def force():
+        time.sleep(2)
+        subprocess.run(["pkill", "-9", "-f", tag])
+    threading.Thread(target=force, daemon=True).start()
+
 def launch(tile):
     """Start a tile's app. Returns False if it could not be started."""
     if tile.get("action") == "close":
-        subprocess.run(["pkill", "-f", "tvmenu" + "-profile"])
+        close_menu()
         return True
     if not tile.get("exec"):
         return False
