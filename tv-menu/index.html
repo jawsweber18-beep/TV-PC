@@ -151,6 +151,7 @@ async function open(tile) {
   toast("Opening " + tile.dataset.name + "…");
   const r = await fetch(`/api/launch?id=${tile.dataset.id}&token=${TOKEN}`, { method: "POST" });
   if (!r.ok) toast("Couldn't open " + tile.dataset.name);
+  else if ((await r.json()).already) toast(tile.dataset.name + " is already open");
   setTimeout(checkRunning, 1000);
 }
 

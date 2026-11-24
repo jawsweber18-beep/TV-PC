@@ -47,7 +47,7 @@ DEFAULT_APPS = [
     {"name": "YouTube", "glyph": "▶", "color": "#d93025",
      "exec": ["flatpak", "run", "com.brave.Browser",
               f"--user-data-dir={HOME}/.var/app/com.brave.Browser/youtube-profile",
-              "--kiosk", "https://www.youtube.com"]},
+              "--password-store=basic", "--start-fullscreen", "--app=https://www.youtube.com"]},
     {"name": "Steam", "icon": "steam", "exec": ["steam", "steam://open/bigpicture"]},
     {"name": "Browser", "icon": "com.brave.Browser", "exec": ["flatpak", "run", "com.brave.Browser"]},
     {"name": "Desktop", "icon": "user-desktop", "glyph": "⌂", "color": "#4f9cf9", "action": "close"},
@@ -140,7 +140,12 @@ def build_tiles():
     if not CONFIG.exists():
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CONFIG.write_text(json.dumps(DEFAULT_APPS, indent=2, ensure_ascii=False))
-    items = [dict(app, section="Apps") for app in json.loads(CONFIG.read_text())]
+    apps = json.loads(CONFIG.read_text())
+    for app in apps:  # older installs opened YouTube in kiosk mode, which can't leave full-screen
+        cmd = app.get("exec") or []
+        if "--kiosk" in cmd and "https://www.youtube.com" in cmd:
+            app["exec"] = DEFAULT_APPS[0]["exec"]
+    items = [dict(app, section="Apps") for app in apps]
     for folder, (label, exts, cmd) in SYSTEMS.items():
         for rom in sorted((ROMS / folder).rglob("*"), key=lambda p: p.name.lower()):
             if rom.is_file() and rom.suffix.lower() in exts:
@@ -244,6 +249,63 @@ def close(entry):
             subprocess.run(["flatpak", "kill", instance], capture_output=True)
     threading.Thread(target=force, daemon=True).start()
 
+def kwin(script):
+    """Run a KWin script in the desktop session, to minimize, restore or un-full-screen windows."""
+    path = HOME / ".cache/tv-menu/kwin.js"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(script)
+    env = session_env()
+
+    def call(obj, method, *args):
+        return subprocess.run(["gdbus", "call", "--session", "--dest", "org.kde.KWin", "--object-path", obj,
+                               "--method", method, *args], env=env, capture_output=True, text=True, timeout=5)
+    try:
+        call("/Scripting", "org.kde.kwin.Scripting.unloadScript", "tvmenu")
+        out = call("/Scripting", "org.kde.kwin.Scripting.loadScript", str(path), "tvmenu")
+        found = re.search(r"int32 (-?\d+)", out.stdout)
+        if not found or int(found.group(1)) < 0:
+            raise RuntimeError(out.stderr.strip() or out.stdout.strip() or "loadScript failed")
+        for obj in (f"/Scripting/Script{found.group(1)}", f"/{found.group(1)}"):  # Plasma 6, then Plasma 5
+            if call(obj, "org.kde.kwin.Script.run").returncode == 0:
+                return True
+        raise RuntimeError("could not run the KWin script")
+    except (OSError, subprocess.SubprocessError, RuntimeError) as e:
+        with open(LOG, "a") as log:
+            log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] window control failed: {e}\n")
+        return False
+
+KWIN_WINDOWS = "const all = workspace.windowList ? workspace.windowList() : workspace.clientList();\n"
+
+def show_desktop():
+    """Take every app out of full-screen and minimize it to the taskbar."""
+    kwin(KWIN_WINDOWS + "for (const w of all) if (w.normalWindow) { w.fullScreen = false; w.minimized = true; }\n")
+
+def process_tree(pid):
+    """pid and all of its descendants, so a sandboxed app's windows can be found."""
+    children = {}
+    for stat in glob.glob("/proc/[0-9]*/stat"):
+        try:
+            fields = Path(stat).read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        children.setdefault(int(fields[1]), []).append(int(stat.split("/")[2]))
+    tree, todo = set(), [pid]
+    while todo:
+        p = todo.pop()
+        if p not in tree:
+            tree.add(p)
+            todo.extend(children.get(p, []))
+    return tree
+
+def bring_back(entry):
+    """Restore an app the menu already opened, full-screen and in front."""
+    pids = sorted(process_tree(entry["proc"].pid))
+    return kwin(KWIN_WINDOWS + f"const pids = {json.dumps(pids)};\n"
+                "for (const w of all) if (pids.includes(w.pid)) {\n"
+                "  w.minimized = false; w.fullScreen = true;\n"
+                "  if ('activeWindow' in workspace) workspace.activeWindow = w; else workspace.activeClient = w;\n"
+                "}\n")
+
 def close_menu():
     """Close the menu's browser, forcing it if it hasn't quit within two seconds."""
     tag = "tvmenu" + "-profile"  # split so this server's own command line never matches
@@ -257,6 +319,7 @@ def close_menu():
 def launch(tile):
     """Start a tile's app. Returns False if it could not be started."""
     if tile.get("action") == "close":
+        show_desktop()
         close_menu()
         return True
     if not tile.get("exec"):
@@ -319,6 +382,10 @@ class Handler(BaseHTTPRequestHandler):
             or next((t for t in tiles(max_age=0) if t["id"] == tid), None)
         if not tile:
             return self.send(404, b"", "text/plain")
+        entry = next((r for r in running() if r["tile"]["id"] == tid), None)
+        if entry:  # already open: show it again instead of starting a second copy
+            bring_back(entry)
+            return self.send(200, b'{"already": true}', "application/json")
         if launch(tile):
             self.send(200, b"{}", "application/json")
         else:
